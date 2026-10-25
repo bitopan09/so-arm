@@ -1,0 +1,11 @@
+# runtime
+poses.json
+__pycache__/
+*.pyc
+.venv/
+
+# mediapipe models (auto-downloaded)
+*.task
+
+# os
+.DS_Store
