@@ -15,6 +15,8 @@ scripts run on the Jetson, which plugs into the controller board over USB.
 | `idle.py`         | "Alive" breathing micro-motions when idle — subtle, organic, non-repeating | ❌ |
 | `brain.py`        | Command brain: *grab*, *put*, *wave*, emotions, chat (optional LLM) | ❌ |
 | `hand_teleop.py`  | Mirror your arm via the camera (hand/arm tracking) + grab-and-place | ✅ |
+| `pick_ball.py`    | Detect an orange ball (top-down camera) and pick it up | ✅ |
+| `vision.py`       | Orange-ball color detection (imported by `pick_ball.py`) | — |
 
 All motion is clamped to the arm's calibrated range, so nothing can over-drive.
 
