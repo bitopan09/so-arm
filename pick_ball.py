@@ -102,6 +102,8 @@ def pick(robot, cap, refs, home):
         return
     px, py, _ = det
     pose = map_to_pose(coefs, px, py)
+    pose["gripper"] = GRIP_OPEN  # add gripper so move_to doesn't KeyError
+    home["gripper"] = GRIP_OPEN
     print(f"Ball at ({px:.0f},{py:.0f}) -> arm pose { {j: round(pose[j],1) for j in pose} }")
 
     set_gripper(robot, GRIP_OPEN)
