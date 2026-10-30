@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 
 from brain import move_to, read_pose, set_gripper
-from emotions import JOINTS, make_robot
+from emotions import JOINTS, clamp, make_robot, read_ranges
 from vision import detect_orange_ball
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -166,7 +166,11 @@ def teach(robot, cap):
 
 
 def do_pick(robot, coefs, home, px, py):
-    pose = map_to_pose(coefs, px, py)
+    ranges = read_ranges(robot)
+    raw = map_to_pose(coefs, px, py)
+    pose = {j: clamp(raw[j], ranges[j][0], ranges[j][1]) for j in JOINTS}
+    if any(abs(pose[j] - raw[j]) > 0.5 for j in JOINTS):
+        print("  ! warning: mapped pose was out of range -> clamped. Teach more spread-out points.")
     pose["gripper"] = GRIP_OPEN
     h = dict(home)
     h["gripper"] = GRIP_OPEN
