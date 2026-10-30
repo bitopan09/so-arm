@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 """
-pick_ball.py — find an orange ping-pong ball with a top-down camera and pick it up.
+pick_ball.py — detect an orange ping-pong ball with a top-down camera and pick it up.
 
-How it works (no depth, no IK):
-  1. `--teach`  : record a "home" pose + N grab poses (ball placed at N table spots,
-                  arm moved by hand to grab each). Saved to pick_refs.json.
-  2. (default)   : detect the orange ball -> map its pixel position to an arm pose via
-                  a linear fit over the taught points -> approach, grab, lift.
+Modes:
+  teach        record a home pose + N grab poses (ball at N table spots)
+  (default)    LIVE: stream an annotated feed to your browser, type 'grab' to pick
+  --once       detect + grab once, then exit (no stream)
 
-Run from the LeRobot repo / so-arm folder:
-  uv run python pick_ball.py teach --port /dev/ttyACM0 --id my_arm --camera 0
-  uv run python pick_ball.py --port /dev/ttyACM0 --id my_arm --camera 0
+Live feed — open in any browser on the same network:
+  http://<jetson-ip>:8080/
+
+The overlay shows the detected ball (green circle + crosshair) and every taught
+reference point (red dots). If the ball sits OUTSIDE the taught dots, the mapping is
+extrapolating and will miss — teach more points that cover the whole reachable area.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import select
+import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from brain import move_to, read_pose, set_gripper
-from emotions import ALL, JOINTS, make_robot
+from emotions import JOINTS, make_robot
 from vision import detect_orange_ball
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -33,9 +39,58 @@ REFS_FILE = SCRIPT_DIR / "pick_refs.json"
 GRIP_OPEN = 5.0
 GRIP_CLOSED = 95.0
 
+_latest_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+
+def _set_latest(frame):
+    global _latest_frame
+    _latest_frame = frame
+
+
+class _StreamHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send_index()
+        elif self.path == "/stream.mjpg":
+            self._send_stream()
+        else:
+            self.send_error(404)
+
+    def _send_index(self):
+        html = b'<html><body style="margin:0;background:#000"><img src="/stream.mjpg" style="width:100%"></body></html>'
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(html)))
+        self.end_headers()
+        self.wfile.write(html)
+
+    def _send_stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            while True:
+                ok, buf = cv2.imencode(".jpg", _latest_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if not ok:
+                    time.sleep(0.05)
+                    continue
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
+                self.wfile.write(buf.tobytes())
+                self.wfile.write(b"\r\n")
+                time.sleep(0.03)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+def start_stream(port=8080):
+    srv = ThreadingHTTPServer(("0.0.0.0", port), _StreamHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
 
 def fit_mapping(refs):
-    """Fit a per-joint affine map (px, py, 1) -> joint value by least squares."""
     X = np.array([[r["px"], r["py"], 1.0] for r in refs])
     joints = list(refs[0]["pose"].keys())
     coefs = {}
@@ -50,8 +105,25 @@ def map_to_pose(coefs, px, py):
     return {j: float(np.dot(coefs[j], v)) for j in coefs}
 
 
+def annotate(frame, det, coefs, refs):
+    out = frame.copy()
+    if det is not None:
+        x, y, r = det
+        cx, cy = int(x), int(y)
+        cv2.circle(out, (cx, cy), max(2, int(r)), (0, 255, 0), 2)
+        cv2.line(out, (cx - 20, cy), (cx + 20, cy), (0, 255, 0), 1)
+        cv2.line(out, (cx, cy - 20), (cx, cy + 20), (0, 255, 0), 1)
+        cv2.putText(out, f"({cx},{cy})", (cx + 12, cy - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        if coefs is not None:
+            pose = map_to_pose(coefs, x, y)
+            cv2.putText(out, f"pan={pose.get('shoulder_pan', 0):.0f} dist~elbow={pose.get('elbow_flex', 0):.0f}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    for r in refs:
+        cv2.circle(out, (int(r["px"]), int(r["py"])), 4, (0, 0, 255), -1)
+    return out
+
+
 def wait_for_ball(cap, timeout=10.0, fps=10):
-    """Read frames until an orange ball is seen; return (px, py, radius) or (None,...)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         ok, frame = cap.read()
@@ -72,10 +144,10 @@ def teach(robot, cap):
     robot.bus.enable_torque()
 
     while True:
-        ans = input("Place the ball somewhere on the table. Type 'r' to record a grab pose, or 'done' to finish: ").strip()
-        if ans.lower() == "done":
+        ans = input("Type 'r' to record a grab pose (ball placed somewhere), or 'done': ").strip().lower()
+        if ans == "done":
             break
-        if ans.lower() != "r":
+        if ans != "r":
             continue
         det = wait_for_ball(cap)
         if det is None:
@@ -93,33 +165,61 @@ def teach(robot, cap):
     print(f"Saved {len(refs)} refs + home to {REFS_FILE}")
 
 
-def pick(robot, cap, refs, home):
-    coefs = fit_mapping(refs)
-    print("Looking for the orange ball...")
-    det = wait_for_ball(cap)
-    if det is None:
-        print("No ball found.")
-        return
-    px, py, _ = det
+def do_pick(robot, coefs, home, px, py):
     pose = map_to_pose(coefs, px, py)
-    pose["gripper"] = GRIP_OPEN  # add gripper so move_to doesn't KeyError
-    home["gripper"] = GRIP_OPEN
-    print(f"Ball at ({px:.0f},{py:.0f}) -> arm pose { {j: round(pose[j],1) for j in pose} }")
-
+    pose["gripper"] = GRIP_OPEN
+    h = dict(home)
+    h["gripper"] = GRIP_OPEN
+    print(f"grab at ({px:.0f},{py:.0f}) -> { {j: round(pose[j], 1) for j in pose} }")
     set_gripper(robot, GRIP_OPEN)
-    move_to(robot, pose, 2.0)          # approach (gripper open)
-    set_gripper(robot, GRIP_CLOSED)    # grab
+    move_to(robot, pose, 2.0)
+    set_gripper(robot, GRIP_CLOSED)
     time.sleep(0.3)
-    move_to(robot, home, 2.0)          # lift
-    print("Grabbed the ball.")
+    move_to(robot, h, 2.0)
+    print("grabbed")
+
+
+def interactive(robot, cap, refs, home, stream_port):
+    coefs = fit_mapping(refs) if len(refs) >= 3 else None
+    if coefs is None:
+        print("Need >= 3 taught refs for a mapping — run 'teach' first.")
+    start_stream(stream_port)
+    print(f"Live feed: open http://<jetson-ip>:{stream_port}/ in a browser")
+    print("Type 'grab' (or 'g') to pick up the ball. 'q' to quit.")
+    while True:
+        ok, frame = cap.read()
+        if ok:
+            det = detect_orange_ball(frame)
+            _set_latest(annotate(frame, det, coefs, refs))
+        else:
+            time.sleep(0.05)
+
+        cmd = None
+        if select.select([sys.stdin], [], [], 0)[0]:
+            cmd = sys.stdin.readline().strip().lower()
+        if cmd in ("q", "quit", "exit"):
+            break
+        if cmd in ("g", "grab", "pick"):
+            if coefs is None:
+                print("  ! need >= 3 taught refs")
+            else:
+                ok2, f2 = cap.read()
+                det2 = detect_orange_ball(f2) if ok2 else None
+                if det2 is None:
+                    print("  ! no ball in view")
+                else:
+                    do_pick(robot, coefs, home, *det2[:2])
+        time.sleep(0.03)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Detect an orange ball and pick it up.")
     ap.add_argument("mode", nargs="?", choices=["teach"], default=None)
-    ap.add_argument("--port", required=True, help="e.g. /dev/ttyACM0")
+    ap.add_argument("--port", required=True, help="arm serial port, e.g. /dev/ttyACM0")
     ap.add_argument("--id", dest="robot_id", default="my_arm")
-    ap.add_argument("--camera", type=int, default=0, help="webcam index for the RGB feed")
+    ap.add_argument("--camera", type=int, default=0, help="camera index for the RGB feed")
+    ap.add_argument("--stream-port", type=int, default=8080)
+    ap.add_argument("--once", action="store_true", help="grab once and exit (no stream)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.camera)
@@ -135,10 +235,15 @@ def main():
             print(f"No {REFS_FILE.name} — run 'teach' first.")
             return
         data = json.loads(REFS_FILE.read_text())
-        if len(data["refs"]) < 3:
-            print("Need at least 3 taught refs for a linear fit.")
-            return
-        pick(robot, cap, data["refs"], data["home"])
+        refs, home = data["refs"], data["home"]
+        if args.once:
+            det = wait_for_ball(cap)
+            if det is None:
+                print("No ball found.")
+            else:
+                do_pick(robot, fit_mapping(refs), home, *det[:2])
+        else:
+            interactive(robot, cap, refs, home, args.stream_port)
     finally:
         cap.release()
         robot.disconnect()
