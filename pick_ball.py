@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pick_ball.py — detect an orange ping-pong ball with a top-down camera and pick it up.
+pick_ball.py — detect a colored ping-pong ball with a top-down camera and pick it up.
 
 Modes:
   teach        record a home pose + N grab poses (ball at N table spots)
@@ -31,13 +31,15 @@ import numpy as np
 
 from brain import move_to, read_pose, set_gripper
 from emotions import JOINTS, clamp, make_robot, read_ranges
-from vision import detect_orange_ball
+from vision import BALL_COLORS, detect_ball
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REFS_FILE = SCRIPT_DIR / "pick_refs.json"
 
 GRIP_OPEN = 5.0
 GRIP_CLOSED = 95.0
+COLOR = "blue"          # ball color: blue | orange | green | red | yellow | pink
+LIFT = 18.0             # degrees to raise shoulder_lift after closing (lifts ball off table)
 
 _latest_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
@@ -129,7 +131,7 @@ def wait_for_ball(cap, timeout=10.0, fps=10):
         ok, frame = cap.read()
         if not ok:
             continue
-        det = detect_orange_ball(frame)
+        det = detect_ball(frame, COLOR)
         if det is not None:
             return det
         time.sleep(1.0 / fps)
@@ -166,21 +168,27 @@ def teach(robot, cap):
 
 
 def do_pick(robot, coefs, home, px, py):
+    """Approach -> close -> lift -> carry home."""
     ranges = read_ranges(robot)
     raw = map_to_pose(coefs, px, py)
     pose = {j: clamp(raw[j], ranges[j][0], ranges[j][1]) for j in JOINTS}
     if any(abs(pose[j] - raw[j]) > 0.5 for j in JOINTS):
-        print("  ! warning: mapped pose was out of range -> clamped. Teach more spread-out points.")
+        print("  ! mapped pose out of range -> clamped. Teach more spread-out points.")
     pose["gripper"] = GRIP_OPEN
-    h = dict(home)
-    h["gripper"] = GRIP_OPEN
-    print(f"grab at ({px:.0f},{py:.0f}) -> { {j: round(pose[j], 1) for j in pose} }")
+
+    print(f"grab at ({px:.0f},{py:.0f}) -> { {j: round(pose[j], 1) for j in JOINTS} }")
     set_gripper(robot, GRIP_OPEN)
-    move_to(robot, pose, 2.0)
-    set_gripper(robot, GRIP_CLOSED)
+    move_to(robot, pose, 2.0)          # descend onto the ball
+    time.sleep(0.2)
+    set_gripper(robot, GRIP_CLOSED)    # close
+    time.sleep(0.4)
+
+    lift = dict(pose)
+    lift["shoulder_lift"] = clamp(pose["shoulder_lift"] + LIFT, *ranges["shoulder_lift"])
+    move_to(robot, lift, 0.8)          # lift straight up, ball off the table
     time.sleep(0.3)
-    move_to(robot, h, 2.0)
-    print("grabbed")
+    move_to(robot, {**home, "gripper": GRIP_CLOSED}, 1.8)
+    print("grabbed — ball is in the claw")
 
 
 def interactive(robot, cap, refs, home, stream_port):
@@ -193,7 +201,7 @@ def interactive(robot, cap, refs, home, stream_port):
     while True:
         ok, frame = cap.read()
         if ok:
-            det = detect_orange_ball(frame)
+            det = detect_ball(frame, COLOR)
             _set_latest(annotate(frame, det, coefs, refs))
         else:
             time.sleep(0.05)
@@ -208,7 +216,7 @@ def interactive(robot, cap, refs, home, stream_port):
                 print("  ! need >= 3 taught refs")
             else:
                 ok2, f2 = cap.read()
-                det2 = detect_orange_ball(f2) if ok2 else None
+                det2 = detect_ball(f2, COLOR) if ok2 else None
                 if det2 is None:
                     print("  ! no ball in view")
                 else:
@@ -217,14 +225,18 @@ def interactive(robot, cap, refs, home, stream_port):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Detect an orange ball and pick it up.")
+    global COLOR
+    ap = argparse.ArgumentParser(description="Detect a colored ball and pick it up.")
     ap.add_argument("mode", nargs="?", choices=["teach"], default=None)
     ap.add_argument("--port", required=True, help="arm serial port, e.g. /dev/ttyACM0")
     ap.add_argument("--id", dest="robot_id", default="my_arm")
     ap.add_argument("--camera", type=int, default=0, help="camera index for the RGB feed")
+    ap.add_argument("--color", default=COLOR, choices=list(BALL_COLORS), help=f"ball color (default {COLOR})")
     ap.add_argument("--stream-port", type=int, default=8080)
     ap.add_argument("--once", action="store_true", help="grab once and exit (no stream)")
     args = ap.parse_args()
+
+    COLOR = args.color
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
