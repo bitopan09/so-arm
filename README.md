@@ -15,8 +15,8 @@ scripts run on the Jetson, which plugs into the controller board over USB.
 | `idle.py`         | "Alive" breathing micro-motions when idle — subtle, organic, non-repeating | ❌ |
 | `brain.py`        | Command brain: *grab*, *put*, *wave*, emotions, chat (optional LLM) | ❌ |
 | `hand_teleop.py`  | Mirror your arm via the camera (hand/arm tracking) + grab-and-place | ✅ |
-| `pick_ball.py`    | Detect an orange ball (top-down camera) and pick it up | ✅ |
-| `vision.py`       | Orange-ball color detection (imported by `pick_ball.py`) | — |
+| `pick_ball.py`    | Detect a colored ball (top-down camera), live browser feed, `grab` on demand | ✅ |
+| `vision.py`       | Ball color detection — blue default, also orange/green/red/yellow/pink | — |
 
 All motion is clamped to the arm's calibrated range, so nothing can over-drive.
 
@@ -104,7 +104,31 @@ python brain.py --port /dev/ttyACM0 --id my_arm              # then type: grab |
 
 # hand/arm teleop (needs a camera)
 python hand_teleop.py --port /dev/ttyACM0 --id my_arm --camera 0
+
+# pick a ball with a top-down camera (blue by default; --color for others)
+python pick_ball.py teach --port /dev/ttyACM0 --id my_arm --camera 1   # once: home + 4+ grab poses
+python pick_ball.py --port /dev/ttyACM0 --id my_arm --camera 1         # live feed + type 'grab'
 ```
+
+### pick_ball.py — ball picking
+
+Teaches a pixel→joint mapping from a handful of hand-guided grab poses, then streams
+the annotated camera feed to a browser:
+
+```
+http://<jetson-ip>:8080/     # green circle = detected ball, red dots = taught points
+```
+
+Type `grab` in the terminal (or `--once` for a single headless grab). Grab sequence is
+**open → descend → close → lift 18° → carry home**, so the ball lifts off the table
+instead of being dragged.
+
+Ball colours: `--color blue` (default) `| orange | green | red | yellow | pink`.
+Detection is plain OpenCV HSV — no model download, and no display needed over SSH.
+
+> ⚠️ Keep the ball **inside** the taught points on screen. The linear mapping only
+> interpolates; outside that region it extrapolates and misses. Re-teach when you
+> change ball colour — pixel coords differ per ball.
 
 ### brain.py — the LLM personality (optional)
 
@@ -123,6 +147,13 @@ It needs internet for the LLM; without it, it still understands *grab / put / wa
 - **"Motor not found" / board seen but no motors** → check power supply, the 3-pin
   daisy-chain, and (Waveshare board) the jumpers set to **B (USB)**.
 - **`hand_teleop.py` shows `[NO HAND]`** → move your hand fully into frame, more light.
+- **`pick_ball.py` can't see the ball** → it's an HSV range miss, not a code bug. Run
+  with a different `--color`, add light, and check the feed: no green circle = no
+  detection. Deep shadow on the ball is the usual culprit.
+- **Arm misses the ball but detection looks right** → ball is outside the taught
+  points (red dots). Re-run `teach` with 4+ spread-out spots covering where you play.
+- **`ValueError: Magnitude NNNNN exceeds 32767`** → the mapping extrapolated to an
+  absurd angle; poses are now clamped, but the real fix is more taught points.
 - **Gripper moves the wrong way** → flip `INVERT_GRIP` in `hand_teleop.py`, or swap
   `GRIP_OPEN` / `GRIP_CLOSED` in `brain.py`.
 - **Port not `/dev/ttyACM0`** → `ls /dev/ttyACM*` and use what appears.
